@@ -16,7 +16,7 @@ env:
   DEPLOY_API_URL: "http://13.232.234.162:5000/api"
   UPDATE_TYPE: "component-update"
   COMPONENT_NAME: "oro_ws"
-  GITHUB_REPO: "/home/jay/oro_git_ws/.github/workflows"
+  GITHUB_REPO: "https://github.com/jayogmen/oro_ws.git"
 
 permissions:
   contents: write
