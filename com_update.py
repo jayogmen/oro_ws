@@ -6,10 +6,12 @@ import requests
 import git
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple, Set
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import sys
 
+# Previous dataclass definitions remain the same
 @dataclass
 class ArtifactMetadata:
     buildTime: str
@@ -71,7 +73,7 @@ class ComponentUpdateClient:
         self.device_id = os.getenv("DEVICE_ID", "device-10")
         self.project_name = os.getenv("PROJECT_NAME", "ota_update")
         self.api_base_url = os.getenv("API_URL", "http://13.232.234.162:5000/api")
-        self.component_name = os.getenv("COMPONENT_NAME", "oro_git_ws")
+        self.component_name = os.getenv("COMPONENT_NAME", "oro_ws")
         
         # Ensure required directories exist
         os.makedirs(self.COMPONENT_PATH, exist_ok=True)
@@ -102,6 +104,7 @@ class ComponentUpdateClient:
         self.current_version = self._load_current_version()
 
     def _load_current_version(self) -> Version:
+        # Previous implementation remains the same
         try:
             if os.path.exists(self.VERSION_FILE):
                 with open(self.VERSION_FILE, 'r') as f:
@@ -139,17 +142,35 @@ class ComponentUpdateClient:
         except Exception as e:
             self.logger.error(f"Error saving version file: {e}")
 
-    def _get_changed_packages(self, repo, old_commit, new_commit) -> set:
+    def _find_ros_packages(self, repo_path: str) -> Dict[str, str]:
+        """
+        Find all ROS packages in the repository and return a mapping of
+        package paths to package names
+        """
+        packages = {}
+        for root, _, files in os.walk(repo_path):
+            if 'package.xml' in files:
+                # Get the package name from package.xml
+                import xml.etree.ElementTree as ET
+                package_xml = os.path.join(root, 'package.xml')
+                try:
+                    tree = ET.parse(package_xml)
+                    package_name = tree.getroot().find('name').text
+                    # Store relative path from repo root
+                    rel_path = os.path.relpath(root, repo_path)
+                    packages[rel_path] = package_name
+                except Exception as e:
+                    self.logger.warning(f"Error parsing package.xml at {root}: {e}")
+        return packages
+
+    def _get_changed_packages(self, repo: git.Repo, old_commit: str, new_commit: str) -> Set[str]:
         """Get the list of ROS packages that have changed between commits"""
         try:
-            # Get the diff between commits
-            diff = repo.git.diff(f"{old_commit}..{new_commit}", nameonly=True).split('\n')
+            # Get all packages in the repository
+            packages = self._find_ros_packages(repo.working_dir)
             
-            # Find all package.xml files in the repository
-            package_files = []
-            for root, _, files in os.walk(repo.working_dir):
-                if 'package.xml' in files:
-                    package_files.append(os.path.relpath(root, repo.working_dir))
+            # Get the diff between commits
+            diff = repo.git.diff(f"{old_commit}..{new_commit}", name_only=True).split('\n')
             
             # Check which packages have changes
             changed_packages = set()
@@ -157,23 +178,22 @@ class ComponentUpdateClient:
                 if changed_file:  # Skip empty lines
                     changed_path = os.path.dirname(changed_file)
                     # Check if this file is under any package directory
-                    for package_path in package_files:
+                    for package_path, package_name in packages.items():
                         if changed_path.startswith(package_path):
-                            changed_packages.add(package_path)
+                            changed_packages.add(package_name)
                             break
             
             return changed_packages
         except Exception as e:
             self.logger.error(f"Error determining changed packages: {e}")
-            # If we can't determine changes, return empty set
             return set()
 
-    def _run_colcon_build(self, repo_path: str, packages: set = None):
+    def _run_colcon_build(self, repo_path: str, packages: Set[str] = None):
         """Run colcon build for specific packages"""
         try:
             build_cmd = ["colcon", "build"]
             if packages:
-                # Build only specific packages
+                # Build only specific packages using package names
                 packages_str = " ".join(f"--packages-select {pkg}" for pkg in packages)
                 build_cmd.extend(packages_str.split())
             
@@ -182,18 +202,122 @@ class ComponentUpdateClient:
             os.chdir(repo_path)
             
             self.logger.info(f"Running colcon build command: {' '.join(build_cmd)}")
+            
+            # Create build and install directories if they don't exist
+            os.makedirs("build", exist_ok=True)
+            os.makedirs("install", exist_ok=True)
+            
+            # Execute colcon build
             result = os.system(" ".join(build_cmd))
             
             if result != 0:
                 raise Exception(f"Colcon build failed with exit code {result}")
             
             self.logger.info("Colcon build completed successfully")
+            
+            # Source the setup file after successful build
+            setup_file = os.path.join(repo_path, "install", "setup.bash")
+            if os.path.exists(setup_file):
+                os.system(f"source {setup_file}")
+                
         except Exception as e:
             self.logger.error(f"Error during colcon build: {e}")
             raise
         finally:
             # Always return to original directory
             os.chdir(original_dir)
+
+    def _handle_git_conflicts(self, repo: git.Repo) -> bool:
+        """
+        Handle Git conflicts during pull operations
+        Returns True if conflicts were resolved successfully
+        """
+        try:
+            # Check if there are any local changes
+            if repo.is_dirty():
+                self.logger.warning("Local changes detected. Stashing changes...")
+                repo.git.stash()
+            
+            # Get current branch name
+            current_branch = repo.active_branch.name
+            
+            # Fetch all changes from remote
+            self.logger.info("Fetching all changes from remote...")
+            repo.git.fetch('--all')
+            
+            # Try reset to remote branch state
+            try:
+                self.logger.info(f"Resetting local branch to origin/{current_branch}...")
+                repo.git.reset('--hard', f'origin/{current_branch}')
+            except git.GitCommandError as e:
+                self.logger.warning(f"Hard reset failed: {e}, trying alternative approach...")
+                # If reset fails, try to merge with remote changes
+                repo.git.merge(f'origin/{current_branch}', '--allow-unrelated-histories')
+            
+            # Clean untracked files and directories
+            repo.git.clean('-fd')
+            
+            # Reapply stashed changes if any
+            if repo.git.stash('list'):
+                try:
+                    self.logger.info("Reapplying stashed changes...")
+                    repo.git.stash('pop')
+                except git.GitCommandError as e:
+                    self.logger.warning(f"Conflicts occurred while reapplying stashed changes: {e}")
+                    # If pop fails, keep changes in stash
+                    self.logger.info("Keeping original changes in stash. Manual intervention may be required.")
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error handling git conflicts: {e}")
+            return False
+
+    def _safe_pull(self, repo: git.Repo) -> Tuple[bool, str]:
+        """
+        Safely pull changes from remote repository
+        Returns (success: bool, message: str)
+        """
+        try:
+            # Store current branch name
+            current_branch = repo.active_branch.name
+            
+            # Configure git to allow unrelated histories
+            repo.git.config('pull.rebase', 'false')
+            repo.git.config('pull.ff', 'false')  # Changed from 'only' to 'false'
+            
+            try:
+                # Try regular pull first
+                self.logger.info("Attempting regular pull...")
+                repo.git.pull()
+                return True, "Pull completed successfully"
+                
+            except git.GitCommandError as e:
+                self.logger.warning(f"Regular pull failed: {e}")
+                
+                if "Not possible to fast-forward" in str(e) or "refusing to merge unrelated histories" in str(e):
+                    self.logger.info("Fast-forward failed, attempting conflict resolution...")
+                    if self._handle_git_conflicts(repo):
+                        # Verify we're up to date
+                        local_commit = repo.head.commit
+                        remote_commit = repo.remotes.origin.refs[current_branch].commit
+                        
+                        if local_commit == remote_commit:
+                            return True, "Repository updated successfully after resolving conflicts"
+                        else:
+                            # Final attempt with merge
+                            self.logger.info("Attempting merge with unrelated histories...")
+                            repo.git.pull('--allow-unrelated-histories')
+                            return True, "Repository updated successfully with unrelated histories merge"
+                    else:
+                        return False, "Failed to resolve git conflicts"
+                else:
+                    raise e
+                    
+        except git.GitCommandError as e:
+            return False, f"Git command error: {str(e)}"
+        except Exception as e:
+            return False, f"Unexpected error during pull: {str(e)}"
 
     def _check_and_update_repository(self, update_info: UpdateResponse) -> None:
         try:
@@ -228,17 +352,21 @@ class ComponentUpdateClient:
 
                 if local_commit != remote_commit:
                     self.logger.info("Updates found. Pulling changes...")
-                    origin.pull()
-                    self.logger.info("Updates downloaded successfully")
+                    success, message = self._safe_pull(repo)
                     
-                    # Get list of changed packages
-                    changed_packages = self._get_changed_packages(repo, old_commit, repo.head.commit)
-                    if changed_packages:
-                        self.logger.info(f"Changed packages detected: {changed_packages}")
-                        # Run colcon build only for changed packages
-                        self._run_colcon_build(repo_path, changed_packages)
+                    if success:
+                        self.logger.info(message)
+                        
+                        # Get list of changed packages
+                        changed_packages = self._get_changed_packages(repo, old_commit, repo.head.commit)
+                        if changed_packages:
+                            self.logger.info(f"Changed packages detected: {changed_packages}")
+                            # Run colcon build only for changed packages
+                            self._run_colcon_build(repo_path, changed_packages)
+                        else:
+                            self.logger.info("No ROS packages were modified in this update")
                     else:
-                        self.logger.info("No ROS packages were modified in this update")
+                        raise Exception(f"Failed to pull updates: {message}")
                 else:
                     self.logger.info("Repository is up to date")
 
@@ -264,15 +392,6 @@ class ComponentUpdateClient:
                 )
                 self._save_current_version(new_version)
                 self.current_version = new_version
-
-            # Run post-update script if it exists
-            post_update_script = component_dir / "scripts" / "post_update.sh"
-            if post_update_script.exists():
-                self.logger.info("Running post-update script")
-                os.chmod(post_update_script, 0o755)
-                result = os.system(str(post_update_script))
-                if result != 0:
-                    raise Exception(f"Post-update script failed with exit code {result}")
 
         except Exception as e:
             self.logger.error(f"Failed to update repository: {e}")
@@ -302,18 +421,66 @@ class ComponentUpdateClient:
 
     def run(self) -> None:
         self.logger.info("Starting OTA component update client...")
-        self.logger.info(f"Device ID: {self.device_id}")
-        self.logger.info(f"Project: {self.project_name}")
-        self.logger.info(f"Component: {self.component_name}")
-        self.logger.info(f"Current version: {self.current_version.version}")
         
-        while True:
+        import signal
+        import sys
+        
+        # Flag to control the main loop
+        self._running = True
+        
+        def signal_handler(signum, frame):
+            """Handle shutdown signals gracefully"""
+            self.logger.info(f"Received signal {signum}. Starting graceful shutdown...")
+            self._running = False
+        
+        # Register signal handlers
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
+        
+        try:
+            while self._running:
+                try:
+                    self.check_for_updates()
+                except KeyboardInterrupt:
+                    self.logger.info("Received keyboard interrupt")
+                    break
+                except Exception as e:
+                    self.logger.error(f"Error in main update loop: {e}")
+                    # Wait before retrying to avoid rapid failure loops
+                    time.sleep(60)
+        finally:
+            self._cleanup()
+    
+    def _cleanup(self) -> None:
+        """Perform cleanup operations before shutdown"""
+        try:
+            self.logger.info("Performing cleanup operations...")
+            
+            # Close the requests session
             try:
-                self.check_for_updates()
+                self.session.close()
             except Exception as e:
-                self.logger.error(f"Unexpected error in main loop: {e}")
-                time.sleep(60)
+                self.logger.error(f"Error closing requests session: {e}")
+            
+            # Save final version state
+            try:
+                self._save_current_version(self.current_version)
+            except Exception as e:
+                self.logger.error(f"Error saving final version state: {e}")
+            
+            self.logger.info("Cleanup completed successfully")
+            
+        except Exception as e:
+            self.logger.error(f"Error during cleanup: {e}")
+
+def main():
+    """Main entry point for the OTA component update client"""
+    try:
+        client = ComponentUpdateClient()
+        client.run()
+    except Exception as e:
+        logging.error(f"Fatal error in main: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
-    client = ComponentUpdateClient()
-    client.run()
+    main()
