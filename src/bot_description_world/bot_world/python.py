@@ -323,7 +323,6 @@ class ComponentUpdateClient:
             if original_dir:
                 self.logger.debug(f"Returning to original directory: {original_dir}")
                 os.chdir(original_dir)
-
     def _find_ros_packages(self, repo_path: str) -> Dict[str, str]:
         """Find all ROS packages in the repository"""
         packages = {}
