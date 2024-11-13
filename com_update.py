@@ -225,6 +225,9 @@ class ComponentUpdateClient:
             
             self.logger.info(f"Successfully rolled back to commit {commit_sha}")
             return True
+        except Exception as e:
+            self.logger.error(f"Failed to rollback to commit {commit_sha}: {e}")
+            return False
 
     def _run_colcon_build(self, repo_path: str, packages: Set[str] = None):
         """Run colcon build for specific packages"""
