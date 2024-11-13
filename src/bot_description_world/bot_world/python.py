@@ -146,6 +146,8 @@ class ComponentUpdateClient:
         """Send build status to the server"""
         try:
             url = f"{self.api_base_url}/updateBuildStatus"
+            
+            # Construct payload
             payload = {
                 "deviceId": self.device_id,
                 "projectName": self.project_name,
@@ -155,15 +157,29 @@ class ComponentUpdateClient:
                 "commitSHA": commit_sha
             }
             
+            # Log the payload for debugging
+            self.logger.debug(f"Sending build status payload: {payload}")
+
+            # Send POST request to the server and log the URL
+            self.logger.info(f"Sending POST request to URL: {url}")
             response = self.session.post(url, json=payload, timeout=(5, 15))
+            
+            # Log the response status code and text for full visibility
+            self.logger.debug(f"Response Status Code: {response.status_code}")
+            self.logger.debug(f"Response Text: {response.text}")
+            
+            # Raise an exception if the request failed
             response.raise_for_status()
             
+            # Log success if no exceptions occurred
             self.logger.info(f"Build status sent successfully: {status}, {message}")
             return True
             
-        except Exception as e:
+        except requests.exceptions.RequestException as e:
+            # Log any exception raised during the request
             self.logger.error(f"Failed to send build status: {e}")
             return False
+
 
     def _rollback_to_commit(self, repo: git.Repo, commit_sha: str) -> bool:
         """Rollback to a specific commit"""
