@@ -75,7 +75,7 @@ class ComponentUpdateClient:
         self.device_id = os.getenv("DEVICE_ID", "device-10")
         self.project_name = os.getenv("PROJECT_NAME", "ota_update")
         self.api_base_url = os.getenv("API_URL", "http://13.232.234.162:5000/api")
-        self.component_name = os.getenv("COMPONENT_NAME", "oro_git_ws")
+        self.component_name = os.getenv("COMPONENT_NAME", "oro_ws")
         
         # Ensure required directories exist
         os.makedirs(self.COMPONENT_PATH, exist_ok=True)
