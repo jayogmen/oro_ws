@@ -166,7 +166,7 @@ class ComponentUpdateClient:
         Send build status to the server with enhanced logging and error handling
         """
         try:
-            url = f"{self.api_base_url}/updateBuildStatus"
+            url = f"{self.api_base_url}/updateBuildStatus/{self.device_id}/{self.project_name}/{self.current_version.version}"
             
             # Construct payload
             payload = {
