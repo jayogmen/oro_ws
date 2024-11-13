@@ -11,6 +11,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import sys
 import subprocess
+import traceback
 
 # Previous dataclass definitions remain the same
 @dataclass
@@ -142,45 +143,6 @@ class ComponentUpdateClient:
         except Exception as e:
             self.logger.error(f"Error saving version file: {e}")
 
-    def _send_build_status(self, status: bool, message: str, commit_sha: str) -> bool:
-        """Send build status to the server"""
-        try:
-            url = f"{self.api_base_url}/updateBuildStatus"
-            
-            # Construct payload
-            payload = {
-                "deviceId": self.device_id,
-                "projectName": self.project_name,
-                "componentName": self.component_name,
-                "status": status,
-                "message": message,
-                "commitSHA": commit_sha
-            }
-            
-            # Log the payload for debugging
-            self.logger.debug(f"Sending build status payload: {payload}")
-
-            # Send POST request to the server and log the URL
-            self.logger.info(f"Sending POST request to URL: {url}")
-            response = self.session.post(url, json=payload, timeout=(5, 15))
-            
-            # Log the response status code and text for full visibility
-            self.logger.debug(f"Response Status Code: {response.status_code}")
-            self.logger.debug(f"Response Text: {response.text}")
-            
-            # Raise an exception if the request failed
-            response.raise_for_status()
-            
-            # Log success if no exceptions occurred
-            self.logger.info(f"Build status sent successfully: {status}, {message}")
-            return True
-            
-        except requests.exceptions.RequestException as e:
-            # Log any exception raised during the request
-            self.logger.error(f"Failed to send build status: {e}")
-            return False
-
-
     def _rollback_to_commit(self, repo: git.Repo, commit_sha: str) -> bool:
         """Rollback to a specific commit"""
         try:
@@ -199,73 +161,168 @@ class ComponentUpdateClient:
             self.logger.error(f"Failed to rollback to commit {commit_sha}: {e}")
             return False
 
-    
-    def _run_colcon_build(self, repo_path: str, packages: Set[str] = None, commit_sha: str = None) -> Tuple[bool, str]:
-        """Run colcon build for specific packages"""
+    def _send_build_status(self, status: bool, message: str, commit_sha: str) -> bool:
+        """
+        Send build status to the server with enhanced logging and error handling
+        """
         try:
-            # Construct the colcon build command properly
+            url = f"{self.api_base_url}/updateBuildStatus"
+            
+            # Construct payload
+            payload = {
+                "deviceId": self.device_id,
+                "projectName": self.project_name,
+                "componentName": self.component_name,
+                "status": status,
+                "message": message,
+                "commitSHA": commit_sha
+            }
+            
+            # Detailed logging before sending request
+            self.logger.info(f"Attempting to send build status to {url}")
+            self.logger.debug(f"Build status payload: {payload}")
+            
+            # Log connection attempt
+            self.logger.debug("Initiating POST request to server...")
+            
+            # Send POST request with timeout
+            response = self.session.post(url, json=payload, timeout=(5, 15))
+            
+            # Log response details
+            self.logger.debug(f"Server Response - Status Code: {response.status_code}")
+            self.logger.debug(f"Server Response - Content: {response.text}")
+            
+            # Check response status
+            response.raise_for_status()
+            
+            self.logger.info(f"✓ Build status successfully sent to server")
+            self.logger.debug(f"Status: {status}, Message: {message}, Commit: {commit_sha}")
+            return True
+            
+        except requests.exceptions.ConnectionError as e:
+            self.logger.error(f"❌ Connection error while sending build status: {e}")
+            self.logger.debug(f"Connection details - URL: {url}, Timeout: (5, 15)")
+            return False
+            
+        except requests.exceptions.Timeout as e:
+            self.logger.error(f"❌ Timeout while sending build status: {e}")
+            self.logger.debug("Request timed out after 15 seconds")
+            return False
+            
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"❌ Failed to send build status: {e}")
+            self.logger.debug(f"Full error traceback: {traceback.format_exc()}")
+            return False
+
+
+    def _run_colcon_build(self, repo_path: str, packages: Set[str] = None, commit_sha: str = None) -> Tuple[bool, str]:
+        """
+        Run colcon build for specific packages with enhanced logging and error handling
+        """
+        original_dir = os.getcwd()
+        build_process = None
+        
+        try:
+            # Validate inputs
+            if not os.path.exists(repo_path):
+                raise ValueError(f"Repository path does not exist: {repo_path}")
+                
+            if packages and not all(isinstance(pkg, str) for pkg in packages):
+                raise ValueError("All package names must be strings")
+            
+            # Construct build command
             build_cmd = ["colcon", "build"]
             if packages:
-                # Add --packages-select once, followed by all packages
                 build_cmd.append("--packages-select")
                 build_cmd.extend(packages)
             
-            # Change to repository directory
-            original_dir = os.getcwd()
+            cmd_str = " ".join(build_cmd)
+            
+            # Log build initiation
+            self.logger.info(f"🔧 Initiating colcon build in: {repo_path}")
+            self.logger.info(f"Build command: {cmd_str}")
+            
+            # Change directory and create necessary folders
             os.chdir(repo_path)
             
-            cmd_str = " ".join(build_cmd)
-            self.logger.info(f"Running colcon build command: {cmd_str}")
+            # Create directories with logging
+            for dir_name in ["build", "install"]:
+                dir_path = os.path.join(repo_path, dir_name)
+                if not os.path.exists(dir_path):
+                    self.logger.debug(f"Creating directory: {dir_path}")
+                    os.makedirs(dir_path)
             
-            # Create build and install directories if they don't exist
-            os.makedirs("build", exist_ok=True)
-            os.makedirs("install", exist_ok=True)
-            
-            # Execute colcon build using subprocess for better control and output capture
-            process = subprocess.run(
+            # Execute build with detailed output capture
+            self.logger.info("Starting build process...")
+            build_process = subprocess.run(
                 cmd_str,
                 shell=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True
+                text=True,
+                encoding='utf-8'
             )
             
-            if process.returncode != 0:
-                error_msg = f"Colcon build failed with exit code {process.returncode}\nOutput: {process.stdout}\nError: {process.stderr}"
+            # Process build result
+            if build_process.returncode != 0:
+                error_msg = (
+                    f"❌ Colcon build failed with exit code {build_process.returncode}\n"
+                    f"Command output:\n{build_process.stdout}\n"
+                    f"Error output:\n{build_process.stderr}"
+                )
                 self.logger.error(error_msg)
                 
-                # Send build failure status
                 if commit_sha:
-                    self._send_build_status(False, error_msg, commit_sha)
+                    self.logger.info("Sending build failure status to server...")
+                    status_sent = self._send_build_status(False, error_msg[:500], commit_sha)  # Truncate message if too long
+                    self.logger.debug(f"Build failure status sent: {status_sent}")
+                
                 return False, error_msg
             
-            self.logger.info("Colcon build completed successfully")
+            # Handle successful build
+            self.logger.info("✓ Colcon build completed successfully")
             
-            # Source the setup file after successful build
+            # Source setup file
             setup_file = os.path.join(repo_path, "install", "setup.bash")
             if os.path.exists(setup_file):
-                # Use source command through bash
-                subprocess.run(f"bash -c 'source {setup_file}'", shell=True)
+                self.logger.debug(f"Sourcing setup file: {setup_file}")
+                try:
+                    subprocess.run(
+                        f"bash -c 'source {setup_file}'",
+                        shell=True,
+                        check=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE
+                    )
+                    self.logger.debug("Setup file sourced successfully")
+                except subprocess.CalledProcessError as e:
+                    self.logger.warning(f"Failed to source setup file: {e}")
             
-            # Send build success status
+            # Send success status
             if commit_sha:
-                self._send_build_status(True, "Build completed successfully", commit_sha)
+                self.logger.info("Sending build success status to server...")
+                success_msg = "Build completed successfully"
+                status_sent = self._send_build_status(True, success_msg, commit_sha)
+                self.logger.debug(f"Build success status sent: {status_sent}")
             
             return True, "Build completed successfully"
-                
+            
         except Exception as e:
-            error_msg = f"Error during colcon build: {e}"
+            error_msg = f"❌ Error during colcon build: {str(e)}\n{traceback.format_exc()}"
             self.logger.error(error_msg)
             
-            # Send build failure status on exception
             if commit_sha:
-                self._send_build_status(False, error_msg, commit_sha)
+                self.logger.info("Sending build error status to server...")
+                status_sent = self._send_build_status(False, str(e), commit_sha)
+                self.logger.debug(f"Build error status sent: {status_sent}")
             
             return False, error_msg
             
         finally:
-            # Always return to original directory
-            os.chdir(original_dir)
+            # Cleanup
+            if original_dir:
+                self.logger.debug(f"Returning to original directory: {original_dir}")
+                os.chdir(original_dir)
 
     def _find_ros_packages(self, repo_path: str) -> Dict[str, str]:
         """Find all ROS packages in the repository"""
