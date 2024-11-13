@@ -10,6 +10,7 @@ from typing import Optional, Dict, Any, Tuple, Set
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import sys
+import subprocess
 
 # Previous dataclass definitions remain the same
 @dataclass
@@ -182,44 +183,70 @@ class ComponentUpdateClient:
             self.logger.error(f"Failed to rollback to commit {commit_sha}: {e}")
             return False
 
-    def _run_colcon_build(self, repo_path: str, packages: Set[str] = None) -> Tuple[bool, str]:
+    
+    def _run_colcon_build(self, repo_path: str, packages: Set[str] = None, commit_sha: str = None) -> Tuple[bool, str]:
         """Run colcon build for specific packages"""
         try:
+            # Construct the colcon build command properly
             build_cmd = ["colcon", "build"]
             if packages:
-                # Build only specific packages using package names
-                packages_str = " ".join(f"--packages-select {pkg}" for pkg in packages)
-                build_cmd.extend(packages_str.split())
+                # Add --packages-select once, followed by all packages
+                build_cmd.append("--packages-select")
+                build_cmd.extend(packages)
             
             # Change to repository directory
             original_dir = os.getcwd()
             os.chdir(repo_path)
             
-            self.logger.info(f"Running colcon build command: {' '.join(build_cmd)}")
+            cmd_str = " ".join(build_cmd)
+            self.logger.info(f"Running colcon build command: {cmd_str}")
             
             # Create build and install directories if they don't exist
             os.makedirs("build", exist_ok=True)
             os.makedirs("install", exist_ok=True)
             
-            # Execute colcon build
-            result = os.system(" ".join(build_cmd))
+            # Execute colcon build using subprocess for better control and output capture
+            process = subprocess.run(
+                cmd_str,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
             
-            if result != 0:
-                raise Exception(f"Colcon build failed with exit code {result}")
+            if process.returncode != 0:
+                error_msg = f"Colcon build failed with exit code {process.returncode}\nOutput: {process.stdout}\nError: {process.stderr}"
+                self.logger.error(error_msg)
+                
+                # Send build failure status
+                if commit_sha:
+                    self._send_build_status(False, error_msg, commit_sha)
+                return False, error_msg
             
             self.logger.info("Colcon build completed successfully")
             
             # Source the setup file after successful build
             setup_file = os.path.join(repo_path, "install", "setup.bash")
             if os.path.exists(setup_file):
-                os.system(f"source {setup_file}")
+                # Use source command through bash
+                subprocess.run(f"bash -c 'source {setup_file}'", shell=True)
+            
+            # Send build success status
+            if commit_sha:
+                self._send_build_status(True, "Build completed successfully", commit_sha)
             
             return True, "Build completed successfully"
                 
         except Exception as e:
             error_msg = f"Error during colcon build: {e}"
             self.logger.error(error_msg)
+            
+            # Send build failure status on exception
+            if commit_sha:
+                self._send_build_status(False, error_msg, commit_sha)
+            
             return False, error_msg
+            
         finally:
             # Always return to original directory
             os.chdir(original_dir)
