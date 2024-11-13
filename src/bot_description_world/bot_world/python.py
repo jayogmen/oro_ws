@@ -271,7 +271,7 @@ class ComponentUpdateClient:
                 )
                 self.logger.error(error_msg)
             
-                if commit_sha:
+                if build_process.returncode != 0:
                     self.logger.info("Sending build failure status to server...")
                     status_sent = self._send_build_status(False, error_msg[:500], commit_sha)  # Truncate message if too long
                     self.logger.debug(f"Build failure status sent: {status_sent}")
