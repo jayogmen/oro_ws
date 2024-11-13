@@ -15,7 +15,7 @@ def generate_launch_description():
         [
             FindPackageShare(package_name),
             "worlds",
-            "_kingjayaraju.world"
+            "_kingghfdjghjayaraju.world"
         ]
     )
    

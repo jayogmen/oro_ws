@@ -28,7 +28,7 @@
 
     <gazebo>
         <plugin name="gazebo_ros2_control" filename="libgazebo_ros2_control.so">
-            <parameters>$(find waiter_tree)/config/controller_manager_jayaking.yaml</parameters>
+            <parameters>$(find waiter_tree)/config/controller_manager_jayakinggff.yaml</parameters>
             <parameters>$(find waiter_tree)/config/gazebo_params.yaml</parameters>
         </plugin>
     </gazebo>

@@ -12,6 +12,7 @@ from urllib3.util.retry import Retry
 import sys
 import subprocess
 import traceback
+import datetime
 
 # Previous dataclass definitions remain the same
 @dataclass
@@ -215,114 +216,78 @@ class ComponentUpdateClient:
             return False
 
 
-    def _run_colcon_build(self, repo_path: str, packages: Set[str] = None, commit_sha: str = None) -> Tuple[bool, str]:
-        """
-        Run colcon build for specific packages with enhanced logging and error handling
-        """
+    def _run_colcon_build(self, repo_path: str, packages: Set[str] = None, old_commit=None) -> None:
+        """Run colcon build for specific packages with status reporting and rollback"""
         original_dir = os.getcwd()
-        build_process = None
-        
         try:
-            # Validate inputs
-            if not os.path.exists(repo_path):
-                raise ValueError(f"Repository path does not exist: {repo_path}")
-                
-            if packages and not all(isinstance(pkg, str) for pkg in packages):
-                raise ValueError("All package names must be strings")
-            
-            # Construct build command
             build_cmd = ["colcon", "build"]
             if packages:
-                build_cmd.append("--packages-select")
-                build_cmd.extend(packages)
+                packages_str = " ".join(f"--packages-select {pkg}" for pkg in packages)
+                build_cmd.extend(packages_str.split())
             
-            cmd_str = " ".join(build_cmd)
-            
-            # Log build initiation
-            self.logger.info(f"🔧 Initiating colcon build in: {repo_path}")
-            self.logger.info(f"Build command: {cmd_str}")
-            
-            # Change directory and create necessary folders
+            # Change to repository directory
             os.chdir(repo_path)
             
-            # Create directories with logging
-            for dir_name in ["build", "install"]:
-                dir_path = os.path.join(repo_path, dir_name)
-                if not os.path.exists(dir_path):
-                    self.logger.debug(f"Creating directory: {dir_path}")
-                    os.makedirs(dir_path)
+            self.logger.info(f"Running colcon build command: {' '.join(build_cmd)}")
+            process = subprocess.run(build_cmd, capture_output=True, text=True)
             
-            # Execute build with detailed output capture
-            self.logger.info("Starting build process...")
-            build_process = subprocess.run(
-                cmd_str,
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding='utf-8'
-            )
+            # Prepare build status
+            build_status = {
+                "success": process.returncode == 0,
+                "timestamp": datetime.datetime.now().isoformat(),
+                "packages": list(packages) if packages else "all",
+                "command": " ".join(build_cmd),
+                "output": process.stdout,
+                "error": process.stderr
+            }
             
-            # Process build result
-            if build_process.returncode != 0:
-                error_msg = (
-                    f"❌ Colcon build failed with exit code {build_process.returncode}\n"
-                    f"Command output:\n{build_process.stdout}\n"
-                    f"Error output:\n{build_process.stderr}"
-                )
-                self.logger.error(error_msg)
+            # Report build status to server
+            try:
+                status_url = f"{self.api_base_url}/updateBuildStatus/{self.device_id}/{self.project_name}/{self.current_version.version}"
+                response = self.session.post(status_url, json=build_status)
+                response.raise_for_status()
+            except Exception as e:
+                self.logger.error(f"Failed to report build status: {e}")
+            
+            if process.returncode != 0:
+                self.logger.error(f"Colcon build failed with exit code {process.returncode}")
+                self.logger.error(f"Build error output: {process.stderr}")
                 
-                if commit_sha:
-                    self.logger.info("Sending build failure status to server...")
-                    status_sent = self._send_build_status(False, error_msg[:500], commit_sha)  # Truncate message if too long
-                    self.logger.debug(f"Build failure status sent: {status_sent}")
-                
-                return False, error_msg
+                if old_commit:
+                    self.logger.info("Rolling back to previous commit...")
+                    repo = git.Repo(repo_path)
+                    repo.git.reset('--hard', old_commit.hexsha)
+                    self.logger.info("Rollback successful")
+                    
+                    # Run build again with previous commit
+                    self.logger.info("Running build with previous commit...")
+                    process = subprocess.run(build_cmd, capture_output=True, text=True)
+                    if process.returncode != 0:
+                        raise Exception("Build failed even after rollback")
+                    
+                    # Update build status after rollback
+                    build_status.update({
+                        "success": True,
+                        "rolled_back": True,
+                        "original_failure": True,
+                        "rollback_commit": old_commit.hexsha
+                    })
+                    try:
+                        response = self.session.post(status_url, json=build_status)
+                        response.raise_for_status()
+                    except Exception as e:
+                        self.logger.error(f"Failed to report rollback status: {e}")
+                else:
+                    raise Exception(f"Colcon build failed with exit code {process.returncode}")
             
-            # Handle successful build
-            self.logger.info("✓ Colcon build completed successfully")
-            
-            # Source setup file
-            setup_file = os.path.join(repo_path, "install", "setup.bash")
-            if os.path.exists(setup_file):
-                self.logger.debug(f"Sourcing setup file: {setup_file}")
-                try:
-                    subprocess.run(
-                        f"bash -c 'source {setup_file}'",
-                        shell=True,
-                        check=True,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE
-                    )
-                    self.logger.debug("Setup file sourced successfully")
-                except subprocess.CalledProcessError as e:
-                    self.logger.warning(f"Failed to source setup file: {e}")
-            
-            # Send success status
-            if commit_sha:
-                self.logger.info("Sending build success status to server...")
-                success_msg = "Build completed successfully"
-                status_sent = self._send_build_status(True, success_msg, commit_sha)
-                self.logger.debug(f"Build success status sent: {status_sent}")
-            
-            return True, "Build completed successfully"
+            self.logger.info("Colcon build completed successfully")
             
         except Exception as e:
-            error_msg = f"❌ Error during colcon build: {str(e)}\n{traceback.format_exc()}"
-            self.logger.error(error_msg)
-            
-            if commit_sha:
-                self.logger.info("Sending build error status to server...")
-                status_sent = self._send_build_status(False, str(e), commit_sha)
-                self.logger.debug(f"Build error status sent: {status_sent}")
-            
-            return False, error_msg
-            
+            self.logger.error(f"Error during colcon build: {e}")
+            raise
         finally:
-            # Cleanup
-            if original_dir:
-                self.logger.debug(f"Returning to original directory: {original_dir}")
-                os.chdir(original_dir)
+            # Always return to original directory
+            os.chdir(original_dir)
     def _find_ros_packages(self, repo_path: str) -> Dict[str, str]:
         """Find all ROS packages in the repository"""
         packages = {}
