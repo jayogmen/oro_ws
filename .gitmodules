@@ -1,0 +1,6 @@
+[submodule "libs/ros2_listener"]
+	path = libs/ros2_listener
+	url = https://github.com/jayogmen/ros2_listener.git
+[submodule "libs/ros2_talker"]
+	path = libs/ros2_talker
+	url = https://github.com/jayogmen/ros2_talker.git
